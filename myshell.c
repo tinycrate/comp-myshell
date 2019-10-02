@@ -68,6 +68,10 @@ void print_history(ShellCtx *ctx);
 
 void change_cwd(ShellCtx *ctx, char *dir);
 
+// Takes in a cmd formatted like this: !x such as [!10], [!0], [!49]
+// Returns true when the operation is successful
+int replay_command(ShellCtx *ctx, Cmd cmd);
+
 // Checks if the content of a command/token equals to str
 // str must be null terminated
 int cmd_equals(Cmd cmd, char *str);
@@ -75,7 +79,7 @@ int cmd_equals(Cmd cmd, char *str);
 // Returns a proper null-terminated string that needs to be freed afterwards
 char *get_cmd_string(Cmd cmd);
 
-// Returns true when command has been handled
+// Returns true when the command has been handled
 int parse_shell_cmd(ShellCtx *ctx, CmdToken *token);
 
 ShellCtx *start_shell() {
@@ -181,19 +185,11 @@ void append_ch(Cmd *cmd, char ch) {
     cmd->content[cmd->length++] = ch;
 }
 
-void copy_cmd(Cmd *from, Cmd *to) {
-    to->length = 0;
-    int i;
-    for (i=0;i<from->length;i++) {
-        append_ch(to, from->content[i]);
-    }
-}
-
 char get_next_char(ShellCtx *ctx) {
     Cmd *record_buff = &ctx->cmd_history.record_buff;
     Cmd *replay_buff = &ctx->cmd_history.replay_buff;
     if (replay_buff->length > 0) {
-        return replay_buff->content[replay_buff->length--];
+        return replay_buff->content[--replay_buff->length];
     } 
     char ch = getchar();
     if (ch != '\n') {
@@ -285,6 +281,12 @@ int parse_shell_cmd(ShellCtx *ctx, CmdToken *token) {
         }
         return TRUE;
     }
+    if (token->token.length > 0 && token->token.content[0] == '!') {
+        if (token->next != NULL || !replay_command(ctx, token->token)) {
+            printf("Invalid command.\n");
+        }
+        return TRUE;
+    }
     return FALSE;
 }
 
@@ -302,7 +304,32 @@ void change_cwd(ShellCtx *ctx, char *dir) {
                 break;
         }
     }
+    free(ctx->cwd);
     ctx->cwd = get_current_dir_name();
+}
+
+int replay_command(ShellCtx *ctx, Cmd cmd) {
+    if (cmd.length < 2) return FALSE;
+    char *num_str = malloc(sizeof(char)*(cmd.length));
+    memcpy(num_str, cmd.content+1, cmd.length-1);
+    num_str[cmd.length-1] = '\0';
+    char *endptr;
+    int num = strtol(num_str, &endptr, 10);
+    ctx->cmd_history.count--; // Removes !x command from history
+    if (endptr != num_str && num >= 0 && num < ctx->cmd_history.count) {
+        ctx->cmd_history.replay_buff.length = 0;
+        append_ch(&ctx->cmd_history.replay_buff, '\n');
+        Cmd replayed = ctx->cmd_history.history[num];
+        int i;
+        for (i=replayed.length-1;i>=0;i--) {
+            append_ch(&ctx->cmd_history.replay_buff, replayed.content[i]);
+        }
+        free(num_str);
+        return TRUE;
+    } else {
+        free(num_str);
+        return FALSE;
+    }
 }
 
 int main() {
