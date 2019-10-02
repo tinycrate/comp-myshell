@@ -82,6 +82,9 @@ char *get_cmd_string(Cmd cmd);
 // Returns true when the command has been handled
 int parse_shell_cmd(ShellCtx *ctx, CmdToken *token);
 
+// Returns true when the shell is awaiting user input
+int awaiting_input(ShellCtx *ctx);
+
 ShellCtx *start_shell() {
     ShellCtx *ctx = malloc(sizeof(ShellCtx));
     ctx->cmd_history.history = malloc(sizeof(Cmd)*HISTORY_INITIAL_COUNT);
@@ -332,18 +335,27 @@ int replay_command(ShellCtx *ctx, Cmd cmd) {
     }
 }
 
+int awaiting_input(ShellCtx *ctx) {
+    return ctx->cmd_history.replay_buff.length <= 0;
+}
+
+void debug_cmd(CmdToken *token) {
+    CmdToken *current;
+    for (current = token; current != NULL; current = current->next) {
+        printf("[");
+        print_cmd_safe(current->token);
+        printf("] ");
+    }
+    printf("\n");
+}
+
 int main() {
     ShellCtx *ctx = start_shell();
     while (TRUE) {
-        printf(":%s $ ", ctx->cwd);
-        CmdToken *token = tokenize_cmd(ctx);
-        CmdToken *current;
-        for (current = token; current != NULL; current = current->next) {
-            printf("[");
-            print_cmd_safe(current->token);
-            printf("] ");
+        if (awaiting_input(ctx)) {
+            printf(":%s $ ", ctx->cwd);
         }
-        printf("\n");
+        CmdToken *token = tokenize_cmd(ctx);
         parse_shell_cmd(ctx, token);
     }
     return 0;
