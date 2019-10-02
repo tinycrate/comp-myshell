@@ -130,7 +130,7 @@ CmdToken *tokenize_cmd(ShellCtx *ctx) {
     int begin_cmd = TRUE;
     while (TRUE) {
         char ch = get_next_char(ctx);
-        // Strip begining spaces 
+        // Strip begining spaces
         while (begin_cmd && (strchr(" \t\v\r\f", ch) != NULL)) {
             ch = get_next_char(ctx);
         }
@@ -190,7 +190,7 @@ char get_next_char(ShellCtx *ctx) {
     Cmd *replay_buff = &ctx->cmd_history.replay_buff;
     if (replay_buff->length > 0) {
         return replay_buff->content[--replay_buff->length];
-    } 
+    }
     char ch = getchar();
     if (ch != '\n') {
         append_ch(record_buff, ch);
@@ -199,7 +199,7 @@ char get_next_char(ShellCtx *ctx) {
         if (ctx->cmd_history.count >= ctx->cmd_history.max_count) {
             ctx->cmd_history.max_count *= 2;
             ctx->cmd_history.history = realloc(
-                                           ctx->cmd_history.history, 
+                                           ctx->cmd_history.history,
                                            sizeof(Cmd)*ctx->cmd_history.max_count
                                        );
         }
@@ -222,7 +222,7 @@ char get_escaped_char(ShellCtx *ctx) {
         case 'v':
             return '\v';
         case 'b':
-            return '\b';    
+            return '\b';
         default:
             return escaped;
     }
@@ -241,7 +241,7 @@ void destroy_token(CmdToken *token) {
 char *get_cmd_string(Cmd cmd) {
     char *cmd_str = malloc(sizeof(char)*(cmd.length+1));
     memcpy(cmd_str, cmd.content, cmd.length);
-    cmd_str[cmd.length] = '\0';  
+    cmd_str[cmd.length] = '\0';
     return cmd_str;
 }
 
