@@ -234,7 +234,10 @@ CmdToken *tokenize_cmd(ShellCtx *ctx) {
     int switch_new_token = TRUE;
     while (TRUE) {
         char ch = get_next_char(ctx);
-        if (ch == EOF) exit(EXIT_SUCCESS);
+        if (ch == EOF) {
+            printf("\n");
+            exit(EXIT_SUCCESS);
+        }
         if (ch == '\n') break;
         if (ch == '>' || ch == '<' || ch == '|') {
             // Make a new token
