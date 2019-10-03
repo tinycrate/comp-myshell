@@ -4,6 +4,9 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <string.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
 #define TRUE 1
 #define FALSE 0
 
@@ -13,7 +16,7 @@
 
 #define CMD_INITIAL_SIZE 16
 #define HISTORY_INITIAL_COUNT 16
-#define BIN_PATH "/bin/" // Good for now
+#define PROC_ARGS_INITIAL_COUNT 16
 
 /* A structure to store arbitrary length of a command/token */
 typedef struct Cmd {
@@ -44,6 +47,18 @@ typedef struct ShellCtx {
     char *cwd;
 } ShellCtx;
 
+/* Stores the process being executed */
+typedef struct Process {
+    struct Process *prev;
+    int redir_in, redir_out;
+    int pipe_out;
+    char *bin;
+    char **args;
+    int args_count;
+    int args_max_count;
+    struct Process *next;
+} Process;
+
 /**
 * Function declarations
 */
@@ -55,35 +70,58 @@ void destroy_cmd();
 
 CmdToken *make_token();
 CmdToken *make_token_after(CmdToken *parent);
-CmdToken *tokenize_cmd(ShellCtx *ctx);
+void destroy_token(CmdToken *token);
+
+Process *make_process();
+Process *make_process_after(Process *preceding);
+void destroy_processes(Process *proc);
 
 char get_next_char(ShellCtx *ctx);
 char get_escaped_char(ShellCtx *ctx);
 void append_ch(Cmd *cmd, char ch);
-void parse_token_quoted(ShellCtx *ctx, char quote, CmdToken *token);
-void destroy_token(CmdToken *token);
 
 void print_cmd_safe(Cmd cmd);
 void print_history(ShellCtx *ctx);
 
 void change_cwd(ShellCtx *ctx, char *dir);
 
+// Read and parse user input into tokens
+CmdToken *tokenize_cmd(ShellCtx *ctx);
+
+// Parse quoted string into a single token
+void parse_token_quoted(ShellCtx *ctx, char quote, CmdToken *token);
+
 // Takes in a cmd formatted like this: !x such as [!10], [!0], [!49]
+// Replays the xth command in myhistory
 // Returns true when the operation is successful
 int replay_command(ShellCtx *ctx, Cmd cmd);
 
-// Checks if the content of a command/token equals to str
-// str must be null terminated
+// Checks if the content of a command/token starts with `str`
+// `str` must be null terminated
+int cmd_starts_with(Cmd cmd, char *str);
+
+// Checks if the content of a command/token equals to `str`
+// `str` must be null terminated
 int cmd_equals(Cmd cmd, char *str);
 
-// Returns a proper null-terminated string that needs to be freed afterwards
+// Returns a proper null-terminated string of `cmd` that needs to be freed afterwards
 char *get_cmd_string(Cmd cmd);
 
+// Checks for and handles shell commands like cd, !x, myhistory
 // Returns true when the command has been handled
 int parse_shell_cmd(ShellCtx *ctx, CmdToken *token);
 
+// Returns the number of process should be executed if successful, otherwise returns 0
+// A list of processes is stored in `result` for execution
+// Processes in `result` have to be cleaned up using destroy_processes()
+// Even if the function returns 0 (unsuccessful), `result` still have to cleaned up
+int parse_process_cmd(ShellCtx *ctx, CmdToken *token, Process **result);
+
 // Returns true when the shell is awaiting user input
 int awaiting_input(ShellCtx *ctx);
+
+// Returns true when the token contains special shell commands
+int is_special_token(CmdToken *token);
 
 ShellCtx *start_shell() {
     ShellCtx *ctx = malloc(sizeof(ShellCtx));
@@ -126,27 +164,81 @@ CmdToken *make_token_after(CmdToken *parent) {
     return child;
 }
 
+void destroy_token(CmdToken *token) {
+    CmdToken *current = token;
+    while (current != NULL) {
+        CmdToken *old = current;
+        current = current->next;
+        destroy_cmd(&old->token);
+        free(old);
+    }
+}
+
+Process *make_process() {
+    Process *proc = malloc(sizeof(Process));
+    proc->prev = NULL;
+    proc->redir_in = -1;
+    proc->redir_out = -1;
+    proc->pipe_out = -1;
+    proc->bin = NULL;
+    proc->args = malloc(sizeof(char*)*PROC_ARGS_INITIAL_COUNT);
+    proc->args[0] = NULL;
+    proc->args_count = 0;
+    proc->args_max_count = PROC_ARGS_INITIAL_COUNT;
+    proc->next = NULL;
+    return proc;
+}
+
+Process *make_process_after(Process *preceding) {
+    Process *proc = make_process();
+    preceding->next = proc;
+    proc->prev = preceding;
+    return proc;
+}
+
+void destroy_processes(Process *proc) {
+    Process *current = proc;
+    while (current != NULL) {
+        Process *old = current;
+        current = current->next;
+        if (old->redir_in != -1 && !close(old->redir_in)) {
+            old->redir_in = -1;
+        }
+        if (old->redir_out != -1 && !close(old->redir_out)) {
+            old->redir_out = -1;
+        }
+        if (old->pipe_out != -1 && !close(old->pipe_out)) {
+            old->pipe_out = -1;
+        }
+        free(old->bin);
+        old->bin = NULL;
+        int i;
+        for(i=0;i<old->args_count;i++) {
+            free(old->args[i]);
+        }
+        old->args_count = 0;
+        free(old->args);
+        old->args = NULL;
+        free(old);
+    }
+}
+
 CmdToken *tokenize_cmd(ShellCtx *ctx) {
-    CmdToken *root = make_token();
-    CmdToken *current = root;
-    int switch_new_token = FALSE;
-    int begin_cmd = TRUE;
+    CmdToken *root = NULL;
+    CmdToken *current = NULL;
+    int switch_new_token = TRUE;
     while (TRUE) {
         char ch = get_next_char(ctx);
-        // Strip begining spaces
-        while (begin_cmd && (strchr(" \t\v\r\f", ch) != NULL)) {
-            ch = get_next_char(ctx);
-        }
-        begin_cmd = FALSE;
         if (ch == EOF) exit(EXIT_SUCCESS);
         if (ch == '\n') break;
-        if (ch == '"' || ch == '\'') {
-            parse_token_quoted(ctx, ch, current);
-            continue;
-        }
         if (ch == '>' || ch == '<' || ch == '|') {
-            // Ends writing to current token
-            current = make_token_after(current);
+            // Ends writing to current token if something's written already
+            if (root == NULL) {
+                root = make_token();
+                current = root;
+            } else {
+                current = make_token_after(current);
+            }
             // Writes a single character to the new token
             append_ch(&current->token, ch);
             switch_new_token = TRUE;
@@ -160,10 +252,19 @@ CmdToken *tokenize_cmd(ShellCtx *ctx) {
             ch = get_escaped_char(ctx);
         }
         if (switch_new_token) {
-            current = make_token_after(current);
+            if (root == NULL) {
+                root = make_token();
+                current = root;
+            } else {
+                current = make_token_after(current);
+            }
             switch_new_token = FALSE;
         }
-        append_ch(&current->token, ch);
+        if (ch == '"' || ch == '\'') {
+            parse_token_quoted(ctx, ch, current);
+        } else {
+            append_ch(&current->token, ch);
+        }
     }
     return root;
 }
@@ -201,8 +302,7 @@ char get_next_char(ShellCtx *ctx) {
         // Adds to history
         if (ctx->cmd_history.count >= ctx->cmd_history.max_count) {
             ctx->cmd_history.max_count *= 2;
-            ctx->cmd_history.history = realloc(
-                                           ctx->cmd_history.history,
+            ctx->cmd_history.history = realloc(ctx->cmd_history.history,
                                            sizeof(Cmd)*ctx->cmd_history.max_count
                                        );
         }
@@ -231,16 +331,6 @@ char get_escaped_char(ShellCtx *ctx) {
     }
 }
 
-void destroy_token(CmdToken *token) {
-    CmdToken *current = token;
-    while (current != NULL) {
-        CmdToken *old = current;
-        current = current->next;
-        destroy_cmd(&old->token);
-        free(old);
-    }
-}
-
 char *get_cmd_string(Cmd cmd) {
     char *cmd_str = malloc(sizeof(char)*(cmd.length+1));
     memcpy(cmd_str, cmd.content, cmd.length);
@@ -263,6 +353,13 @@ void print_history(ShellCtx *ctx) {
     }
 }
 
+int cmd_starts_with(Cmd cmd, char *str) {
+    int str_len = strlen(str);
+    if (cmd.length < str_len) return FALSE;
+    if (strncmp(cmd.content, str, str_len)) return FALSE;
+    return TRUE;
+}
+
 int cmd_equals(Cmd cmd, char *str) {
     if (cmd.length != strlen(str)) return FALSE;
     if (strncmp(cmd.content, str, cmd.length)) return FALSE;
@@ -280,13 +377,13 @@ int parse_shell_cmd(ShellCtx *ctx, CmdToken *token) {
             change_cwd(ctx, cwd);
             free(cwd);
         } else {
-            printf("Invalid command.\n");
+            printf("Invalid command\n");
         }
         return TRUE;
     }
-    if (token->token.length > 0 && token->token.content[0] == '!') {
+    if (cmd_starts_with(token->token, "!")) {
         if (token->next != NULL || !replay_command(ctx, token->token)) {
-            printf("Invalid command.\n");
+            printf("Invalid command\n");
         }
         return TRUE;
     }
@@ -295,17 +392,7 @@ int parse_shell_cmd(ShellCtx *ctx, CmdToken *token) {
 
 void change_cwd(ShellCtx *ctx, char *dir) {
     if (chdir(dir)) {
-        switch (errno) {
-            case ENOENT:
-                printf("No such file or directory\n");
-                break;
-            case ENOTDIR:
-                printf("Not a directory\n");
-                break;
-            default:
-                printf("Directory inaccessable\n");
-                break;
-        }
+        perror("cd");
     }
     free(ctx->cwd);
     ctx->cwd = get_current_dir_name();
@@ -339,6 +426,106 @@ int awaiting_input(ShellCtx *ctx) {
     return ctx->cmd_history.replay_buff.length <= 0;
 }
 
+int is_special_token(CmdToken *token) {
+    if (token == NULL) return FALSE;
+    if (token->token.length <= 0) return FALSE;
+    return strchr("!|<>", token->token.content[0]) != NULL;
+}
+
+int parse_process_cmd(ShellCtx *ctx, CmdToken *token, Process **result) {
+    *result = make_process();
+    int process_count = 1;
+    Process *cur_process = *result;
+    CmdToken *cur_token;
+    for (cur_token = token; cur_token != NULL; cur_token = cur_token->next) {
+        if (cmd_equals(cur_token->token, "<")) {
+            // Prepare for stdin redirection
+            cur_token = cur_token->next;
+            if (cur_token == NULL || is_special_token(cur_token)) {
+                printf("Invalid command\n");
+                return 0;
+            }
+            char *path = get_cmd_string(cur_token->token);
+            if (cur_process->redir_in != -1) {
+                close(cur_process->redir_in);
+                cur_process->redir_in = -1;
+            }
+            cur_process->redir_in = open(path, O_RDONLY);
+            if (cur_process->redir_in == -1) {
+                perror(path);
+                free(path);
+                return 0;
+            }
+            free(path);
+            continue;
+        }
+        if (cmd_equals(cur_token->token, ">")) {
+            // Prepare for stdout redirection
+            int flags = O_CREAT|O_WRONLY;
+            cur_token = cur_token->next;
+            if (cur_token == NULL) {
+                printf("Invalid command\n");
+                return 0;
+            }
+            if (cmd_equals(cur_token->token, ">")) {
+                flags |= O_APPEND;
+                cur_token = cur_token->next;
+            } else {
+                flags |= O_TRUNC;
+            }
+            if (cur_token == NULL || is_special_token(cur_token)) {
+                printf("Invalid command\n");
+                return 0;
+            }
+            char *path = get_cmd_string(cur_token->token);
+            if (cur_process->redir_out != -1) {
+                close(cur_process->redir_out);
+                cur_process->redir_out = -1;
+            }
+            cur_process->redir_out = open(path, flags, 0664);
+            if (cur_process->redir_out == -1) {
+                perror(path);
+                free(path);
+                return 0;
+            }
+            free(path);
+            continue;
+        }
+        if (cmd_equals(cur_token->token, "|")) {
+            // Prepare for next process
+            // Only pipes output to next process when there's no output redirection
+            if (cur_process->redir_out == -1) {
+                int pipe_fd[2];
+                pipe(pipe_fd);
+                cur_process->redir_out = pipe_fd[1];
+                cur_process->pipe_out = pipe_fd[0];
+            }
+            cur_process = make_process_after(cur_process);
+            continue;
+        }
+        if (is_special_token(cur_token)) {
+            // Undefined special token
+            printf("Invalid command\n");
+            return 0;
+        }
+        // Parse bin and args
+        if (cur_process->bin == NULL) {
+            cur_process->bin = get_cmd_string(cur_token->token);
+        } else {
+            // Count +1 for the NULL pointer of `cur_process.args`
+            if (cur_process->args_count + 1 >= cur_process->args_max_count) {
+                cur_process->args_max_count *= 2;
+                cur_process->args = realloc(cur_process->args,
+                                       sizeof(char*)*cur_process->args_max_count
+                                   );
+            }
+            cur_process->args[cur_process->args_count++] = get_cmd_string(cur_token->token);
+            cur_process->args[cur_process->args_count] = NULL;
+        }
+    }
+    return process_count;
+}
+
 void debug_cmd(CmdToken *token) {
     CmdToken *current;
     for (current = token; current != NULL; current = current->next) {
@@ -349,6 +536,31 @@ void debug_cmd(CmdToken *token) {
     printf("\n");
 }
 
+void debug_proc(Process *proc) {
+    printf("\n===== Execution plan for processes =====\n");
+    Process *current;
+    int i = 1;
+    for (current = proc; current != NULL; current = current->next) {
+        printf("Process [%d]:\n", i++);
+        printf("bin: %s\nredir_in: %d\nredir_out: %d\npipe_out: %d\n",
+            (current->bin != NULL) ? current->bin : "NULL",
+            current->redir_in, current->redir_out, current->pipe_out);
+        printf("Args: ");
+        if (current->args != NULL) {
+            printf("\n");
+            int j;
+            for (j=0;j<current->args_count;j++) {
+                printf(" [%d] %s\n", j, current->args[j]);
+            }
+            printf(" Null terminated? %s\n",
+                (current->args[j]==NULL) ? "YES" : "NO (CRITICAL ERROR!!!)");
+        } else {
+            printf("NULL\n");
+        }
+        printf("\n");
+    }
+}
+
 int main() {
     ShellCtx *ctx = start_shell();
     while (TRUE) {
@@ -356,7 +568,16 @@ int main() {
             printf(":%s $ ", ctx->cwd);
         }
         CmdToken *token = tokenize_cmd(ctx);
-        parse_shell_cmd(ctx, token);
+        if (token == NULL) continue;
+        debug_cmd(token);
+        if (parse_shell_cmd(ctx, token)) continue;
+        printf("DRY RUN:: Creating process plan...\n");
+        Process *proc;
+        parse_process_cmd(ctx, token, &proc);
+        debug_proc(proc);
+        printf("DRY RUN:: Attempting to clean up processes...\n");
+        destroy_processes(proc);
+        printf("DRY RUN:: Done!\n");
     }
     return 0;
 }
