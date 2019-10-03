@@ -232,7 +232,7 @@ CmdToken *tokenize_cmd(ShellCtx *ctx) {
         if (ch == EOF) exit(EXIT_SUCCESS);
         if (ch == '\n') break;
         if (ch == '>' || ch == '<' || ch == '|') {
-            // Ends writing to current token if something's written already
+            // Make a new token
             if (root == NULL) {
                 root = make_token();
                 current = root;
