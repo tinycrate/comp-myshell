@@ -676,6 +676,7 @@ int main() {
         if (token == NULL) continue;
         if (parse_shell_cmd(ctx, token)) continue;
         execute_processes(parse_process_cmd(ctx, token));
+        destroy_token(token);
     }
     return 0;
 }
