@@ -392,6 +392,9 @@ int parse_shell_cmd(ShellCtx *ctx, CmdToken *token) {
         }
         return TRUE;
     }
+    if (cmd_equals(token->token, "exit")) {
+        exit(EXIT_SUCCESS);
+    }
     return FALSE;
 }
 
