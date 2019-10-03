@@ -5,6 +5,7 @@
 #include <unistd.h>
 #include <string.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <sys/stat.h>
 #include <fcntl.h>
 #define TRUE 1
@@ -111,11 +112,14 @@ char *get_cmd_string(Cmd cmd);
 // Returns true when the command has been handled
 int parse_shell_cmd(ShellCtx *ctx, CmdToken *token);
 
-// Returns the number of process should be executed if successful, otherwise returns 0
-// A list of processes is stored in `result` for execution
-// Processes in `result` have to be cleaned up using destroy_processes()
-// Even if the function returns 0 (unsuccessful), `result` still have to cleaned up
-int parse_process_cmd(ShellCtx *ctx, CmdToken *token, Process **result);
+// Returns a list of processes that should be executed
+// The returned list of processes must be cleaned up using destroy_processes()
+// This function will always return at least a Process that needs to be cleaned up
+Process *parse_process_cmd(ShellCtx *ctx, CmdToken *token);
+
+// Executes a list of processes
+// The list of processes will be cleaned up automatically
+void execute_processes(Process *proc);
 
 // Returns true when the shell is awaiting user input
 int awaiting_input(ShellCtx *ctx);
@@ -183,7 +187,8 @@ Process *make_process() {
     proc->bin = NULL;
     proc->args = malloc(sizeof(char*)*PROC_ARGS_INITIAL_COUNT);
     proc->args[0] = NULL;
-    proc->args_count = 0;
+    proc->args[1] = NULL;
+    proc->args_count = 1;
     proc->args_max_count = PROC_ARGS_INITIAL_COUNT;
     proc->next = NULL;
     return proc;
@@ -432,10 +437,9 @@ int is_special_token(CmdToken *token) {
     return strchr("!|<>", token->token.content[0]) != NULL;
 }
 
-int parse_process_cmd(ShellCtx *ctx, CmdToken *token, Process **result) {
-    *result = make_process();
-    int process_count = 1;
-    Process *cur_process = *result;
+Process *parse_process_cmd(ShellCtx *ctx, CmdToken *token) {
+    Process *result = make_process();
+    Process *cur_process = result;
     CmdToken *cur_token;
     for (cur_token = token; cur_token != NULL; cur_token = cur_token->next) {
         if (cmd_equals(cur_token->token, "<")) {
@@ -443,7 +447,7 @@ int parse_process_cmd(ShellCtx *ctx, CmdToken *token, Process **result) {
             cur_token = cur_token->next;
             if (cur_token == NULL || is_special_token(cur_token)) {
                 printf("Invalid command\n");
-                return 0;
+                return result;
             }
             char *path = get_cmd_string(cur_token->token);
             if (cur_process->redir_in != -1) {
@@ -454,7 +458,7 @@ int parse_process_cmd(ShellCtx *ctx, CmdToken *token, Process **result) {
             if (cur_process->redir_in == -1) {
                 perror(path);
                 free(path);
-                return 0;
+                return result;
             }
             free(path);
             continue;
@@ -465,7 +469,7 @@ int parse_process_cmd(ShellCtx *ctx, CmdToken *token, Process **result) {
             cur_token = cur_token->next;
             if (cur_token == NULL) {
                 printf("Invalid command\n");
-                return 0;
+                return result;
             }
             if (cmd_equals(cur_token->token, ">")) {
                 flags |= O_APPEND;
@@ -475,7 +479,7 @@ int parse_process_cmd(ShellCtx *ctx, CmdToken *token, Process **result) {
             }
             if (cur_token == NULL || is_special_token(cur_token)) {
                 printf("Invalid command\n");
-                return 0;
+                return result;
             }
             char *path = get_cmd_string(cur_token->token);
             if (cur_process->redir_out != -1) {
@@ -486,7 +490,7 @@ int parse_process_cmd(ShellCtx *ctx, CmdToken *token, Process **result) {
             if (cur_process->redir_out == -1) {
                 perror(path);
                 free(path);
-                return 0;
+                return result;
             }
             free(path);
             continue;
@@ -506,11 +510,12 @@ int parse_process_cmd(ShellCtx *ctx, CmdToken *token, Process **result) {
         if (is_special_token(cur_token)) {
             // Undefined special token
             printf("Invalid command\n");
-            return 0;
+            return result;
         }
         // Parse bin and args
         if (cur_process->bin == NULL) {
             cur_process->bin = get_cmd_string(cur_token->token);
+            cur_process->args[0] = get_cmd_string(cur_token->token);
         } else {
             // Count +1 for the NULL pointer of `cur_process.args`
             if (cur_process->args_count + 1 >= cur_process->args_max_count) {
@@ -523,7 +528,101 @@ int parse_process_cmd(ShellCtx *ctx, CmdToken *token, Process **result) {
             cur_process->args[cur_process->args_count] = NULL;
         }
     }
-    return process_count;
+    return result;
+}
+
+void execute_processes(Process *proc) {
+    Process *current;
+    int child_count = 0;
+    for (current = proc; current != NULL; current = current->next) {
+        if (current->bin == NULL) {
+            // Nothing to run, closing all fds
+            if (current->redir_in != -1) {
+                close(current->redir_in);
+                current->redir_in = -1;
+            }
+            if (current->redir_out != -1) {
+                close(current->redir_out);
+                current->redir_out = -1;
+            }
+            if (current->pipe_out != -1) {
+                close(current->pipe_out);
+                current->pipe_out = -1;
+            }
+            if (current->prev != NULL && current->prev->pipe_out != -1) {
+                close(current->prev->pipe_out);
+                current->prev->pipe_out = -1;
+            }
+            continue;
+        }
+        child_count++;
+        int pid = fork();
+        if (pid == 0) {
+            // Redirect stdin of parent to the first child only if appropriate
+            if (current == proc && current->redir_in == -1) {
+                current->redir_in = STDIN_FILENO;
+            }
+            // Redirect stdout of parent to the last child only if appropriate
+            if (current->next == NULL && current->redir_out == -1) {
+                current->redir_out = STDOUT_FILENO;
+            }
+            // Close all irrelevant fds
+            destroy_processes(current->next);
+            /* Dups stdin or close it */
+            if (current->redir_in != -1) {
+                dup2(current->redir_in, STDIN_FILENO);
+            }
+            if (current->prev != NULL && current->prev->pipe_out != -1) {
+                // Close prev pipe_out if the process already has a redir_in
+                // Otherwise dup it
+                if (current->redir_in != -1) {
+                    close(current->prev->pipe_out);
+                    current->prev->pipe_out = -1;
+                } else {
+                    current->redir_in = current->prev->pipe_out;
+                    dup2(current->redir_in, STDIN_FILENO);
+                }
+            }
+            // If afterall there's still no stdin redirect, close it
+            if (current->redir_in == -1) {
+                close(STDIN_FILENO);
+            }
+            /* Dups stdout or close it */
+            if (current->redir_out != -1) {
+                dup2(current->redir_out, STDOUT_FILENO);
+            } else {
+                close(STDOUT_FILENO);
+            }
+            // Executes binary
+            execvp(current->bin, current->args);
+            perror(current->bin);
+            exit(EXIT_FAILURE);
+        } else if (pid > 0) {
+            // Close redir_in/redir_out fd
+            if (current->redir_in != -1) {
+                close(current->redir_in);
+                current->redir_in = -1;
+            }
+            if (current->redir_out != -1) {
+                close(current->redir_out);
+                current->redir_out = -1;
+            }
+            // Close prev pipe out
+            if (current->prev != NULL && current->prev->pipe_out != -1) {
+                close(current->prev->pipe_out);
+                current->prev->pipe_out = -1;
+            }
+        } else {
+            perror("fork");
+        }
+    }
+    // Does a final cleanup for strings and args also for the last pipe_out
+    destroy_processes(proc);
+    // Waits children
+    int i;
+    for (i=0;i<child_count;i++) {
+        wait(NULL);
+    }
 }
 
 void debug_cmd(CmdToken *token) {
@@ -569,15 +668,8 @@ int main() {
         }
         CmdToken *token = tokenize_cmd(ctx);
         if (token == NULL) continue;
-        debug_cmd(token);
         if (parse_shell_cmd(ctx, token)) continue;
-        printf("DRY RUN:: Creating process plan...\n");
-        Process *proc;
-        parse_process_cmd(ctx, token, &proc);
-        debug_proc(proc);
-        printf("DRY RUN:: Attempting to clean up processes...\n");
-        destroy_processes(proc);
-        printf("DRY RUN:: Done!\n");
+        execute_processes(parse_process_cmd(ctx, token));
     }
     return 0;
 }
