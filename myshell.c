@@ -112,9 +112,9 @@ char *get_cmd_string(Cmd cmd);
 // Returns true when the command has been handled
 int parse_shell_cmd(ShellCtx *ctx, CmdToken *token);
 
-// Returns a list of processes that should be executed
+// Returns a list of processes that should be executed, NULL when parsing failed
 // The returned list of processes must be cleaned up using destroy_processes()
-// This function will always return at least a Process that needs to be cleaned up
+// Is is possible for this function to return a valid empty process instead of NULL
 Process *parse_process_cmd(ShellCtx *ctx, CmdToken *token);
 
 // Executes a list of processes
@@ -196,7 +196,7 @@ Process *make_process() {
 
 Process *make_process_after(Process *preceding) {
     Process *proc = make_process();
-    preceding->next = proc;
+    if (preceding != NULL) preceding->next = proc;
     proc->prev = preceding;
     return proc;
 }
@@ -447,60 +447,8 @@ Process *parse_process_cmd(ShellCtx *ctx, CmdToken *token) {
     Process *result = make_process();
     Process *cur_process = result;
     CmdToken *cur_token;
+    int valid_process = TRUE;
     for (cur_token = token; cur_token != NULL; cur_token = cur_token->next) {
-        if (cmd_equals(cur_token->token, "<")) {
-            // Prepare for stdin redirection
-            cur_token = cur_token->next;
-            if (cur_token == NULL || is_special_token(cur_token)) {
-                printf("Invalid command\n");
-                return result;
-            }
-            char *path = get_cmd_string(cur_token->token);
-            if (cur_process->redir_in != -1) {
-                close(cur_process->redir_in);
-                cur_process->redir_in = -1;
-            }
-            cur_process->redir_in = open(path, O_RDONLY);
-            if (cur_process->redir_in == -1) {
-                perror(path);
-                free(path);
-                return result;
-            }
-            free(path);
-            continue;
-        }
-        if (cmd_equals(cur_token->token, ">")) {
-            // Prepare for stdout redirection
-            int flags = O_CREAT|O_WRONLY;
-            cur_token = cur_token->next;
-            if (cur_token == NULL) {
-                printf("Invalid command\n");
-                return result;
-            }
-            if (cmd_equals(cur_token->token, ">")) {
-                flags |= O_APPEND;
-                cur_token = cur_token->next;
-            } else {
-                flags |= O_TRUNC;
-            }
-            if (cur_token == NULL || is_special_token(cur_token)) {
-                printf("Invalid command\n");
-                return result;
-            }
-            char *path = get_cmd_string(cur_token->token);
-            if (cur_process->redir_out != -1) {
-                close(cur_process->redir_out);
-                cur_process->redir_out = -1;
-            }
-            cur_process->redir_out = open(path, flags, 0664);
-            if (cur_process->redir_out == -1) {
-                perror(path);
-                free(path);
-                return result;
-            }
-            free(path);
-            continue;
-        }
         if (cmd_equals(cur_token->token, "|")) {
             // Prepare for next process
             // Only pipes output to next process when there's no output redirection
@@ -511,12 +459,75 @@ Process *parse_process_cmd(ShellCtx *ctx, CmdToken *token) {
                 cur_process->pipe_out = pipe_fd[0];
             }
             cur_process = make_process_after(cur_process);
+            valid_process = TRUE;
+            continue;
+        }
+        if (!valid_process) continue;
+        if (cmd_equals(cur_token->token, "<")) {
+            // Prepare for stdin redirection
+            cur_token = cur_token->next;
+            if (cur_token == NULL || is_special_token(cur_token)) {
+                printf("Invalid command\n");
+                destroy_processes(result);
+                return NULL;
+            }
+            char *path = get_cmd_string(cur_token->token);
+            if (cur_process->redir_in != -1) {
+                close(cur_process->redir_in);
+                cur_process->redir_in = -1;
+            }
+            cur_process->redir_in = open(path, O_RDONLY);
+            if (cur_process->redir_in == -1) {
+                perror(path);
+                Process *old = cur_process;
+                cur_process = make_process_after(cur_process->prev);
+                destroy_processes(old);
+                valid_process = FALSE;
+            }
+            free(path);
+            continue;
+        }
+        if (cmd_equals(cur_token->token, ">")) {
+            // Prepare for stdout redirection
+            int flags = O_CREAT|O_WRONLY;
+            cur_token = cur_token->next;
+            if (cur_token == NULL) {
+                printf("Invalid command\n");
+                destroy_processes(result);
+                return NULL;
+            }
+            if (cmd_equals(cur_token->token, ">")) {
+                flags |= O_APPEND;
+                cur_token = cur_token->next;
+            } else {
+                flags |= O_TRUNC;
+            }
+            if (cur_token == NULL || is_special_token(cur_token)) {
+                printf("Invalid command\n");
+                destroy_processes(result);
+                return NULL;
+            }
+            char *path = get_cmd_string(cur_token->token);
+            if (cur_process->redir_out != -1) {
+                close(cur_process->redir_out);
+                cur_process->redir_out = -1;
+            }
+            cur_process->redir_out = open(path, flags, 0664);
+            if (cur_process->redir_out == -1) {
+                perror(path);
+                Process *old = cur_process;
+                cur_process = make_process_after(cur_process->prev);
+                destroy_processes(old);
+                valid_process = FALSE;
+            }
+            free(path);
             continue;
         }
         if (is_special_token(cur_token)) {
             // Undefined special token
             printf("Invalid command\n");
-            return result;
+            destroy_processes(result);
+            return NULL;
         }
         // Parse bin and args
         if (cur_process->bin == NULL) {
